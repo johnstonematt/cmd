@@ -763,7 +763,6 @@ func (rw *OutputStream) Write(p []byte) (n int, err error) {
 				BufferSize: rw.bufSize,
 				BufferFree: bufFree,
 			}
-			fmt.Println(fmt.Errorf(err.Error()))
 			n = firstChar
 			return // implicit
 		}
