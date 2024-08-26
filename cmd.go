@@ -154,7 +154,7 @@ type Options struct {
 
 	// If CombinedOutput is true, STDOUT and STDERR are written only to Status.Stdout
 	// (similar to 2>&1 on Linux), and Status.StdErr will be empty. If CombinedOutput
-	// is used Buffered, CombinedOutput takes preference. CombinedOutput does not work
+	// is used with Buffered, CombinedOutput takes preference. CombinedOutput does not work
 	// with Streaming.
 	CombinedOutput bool
 
@@ -177,6 +177,10 @@ type Options struct {
 	// value DEFAULT_LINE_BUFFER_SIZE is usually sufficient, but if
 	// ErrLineBufferOverflow errors occur, try increasing the size with this field.
 	LineBufferSize uint
+
+	// IgnoreIncompleteLines configures the 'ignoreIncompleteLines' option of the command's
+	// OutputStream's. If set to true, lines that do not end in '\n' are ignored.
+	IgnoreIncompleteLines bool
 }
 
 // NewCmdOptions creates a new Cmd with options. The command is not started
@@ -214,11 +218,11 @@ func NewCmdOptions(options Options, name string, args ...string) *Cmd {
 
 	if options.Streaming {
 		c.Stdout = make(chan string, DEFAULT_STREAM_CHAN_SIZE)
-		c.stdoutStream = NewOutputStream(c.Stdout)
+		c.stdoutStream = NewOutputStream(c.Stdout, options.IgnoreIncompleteLines)
 		c.stdoutStream.SetLineBufferSize(int(options.LineBufferSize))
 
 		c.Stderr = make(chan string, DEFAULT_STREAM_CHAN_SIZE)
-		c.stderrStream = NewOutputStream(c.Stderr)
+		c.stderrStream = NewOutputStream(c.Stderr, options.IgnoreIncompleteLines)
 		c.stderrStream.SetLineBufferSize(int(options.LineBufferSize))
 	}
 
@@ -280,7 +284,7 @@ func (c *Cmd) Start() <-chan Status {
 	return c.StartWithStdin(nil)
 }
 
-// StartWithStdin is the same as Start but uses in for STDIN.
+// StartWithStdin is the same as Start but uses 'in' argument for STDIN.
 func (c *Cmd) StartWithStdin(in io.Reader) <-chan Status {
 	c.Lock()
 	defer c.Unlock()
@@ -527,13 +531,13 @@ func (c *Cmd) run(in io.Reader) {
 		// "*exec.ExitError". With the real type we can get the non-zero
 		// exit code and determine if the process was signaled, which yields
 		// a more specific error message, so we set err again in that case.
-		exiterr := err.(*exec.ExitError)
+		exitErr := err.(*exec.ExitError)
 		err = nil
-		if waitStatus, ok := exiterr.Sys().(syscall.WaitStatus); ok {
+		if waitStatus, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			exitCode = waitStatus.ExitStatus() // -1 if signaled
 			if waitStatus.Signaled() {
 				signaled = true
-				err = errors.New(exiterr.Error()) // "signal: terminated"
+				err = errors.New(exitErr.Error()) // "signal: terminated"
 			}
 		}
 	}
@@ -566,7 +570,7 @@ func (c *Cmd) run(in io.Reader) {
 
 // OutputBuffer represents command output that is saved, line by line, in an
 // unbounded buffer. It is safe for multiple goroutines to read while the command
-// is running and after it has finished. If output is small (a few megabytes)
+// is running, and after it has finished. If output is small (a few megabytes)
 // and not read frequently, an output buffer is a good solution.
 //
 // A Cmd in this package uses an OutputBuffer for both STDOUT and STDERR by
@@ -608,7 +612,7 @@ func (rw *OutputBuffer) Write(p []byte) (n int, err error) {
 }
 
 // Lines returns lines of output written by the Cmd. It is safe to call while
-// the Cmd is running and after it has finished. Subsequent calls returns more
+// the Cmd is running, and after it has finished. Subsequent calls returns more
 // lines, if more lines were written. "\r\n" are stripped from the lines.
 func (rw *OutputBuffer) Lines() []string {
 	rw.Lock()
@@ -682,22 +686,24 @@ func (e ErrLineBufferOverflow) Error() string {
 // While runnableCmd is running, lines are sent to the channel as soon as they
 // are written and newline-terminated by the command.
 type OutputStream struct {
-	streamChan chan string
-	bufSize    int
-	buf        []byte
-	lastChar   int
+	streamChan            chan string
+	bufSize               int
+	buf                   []byte
+	lastChar              int
+	ignoreIncompleteLines bool
 }
 
 // NewOutputStream creates a new streaming output on the given channel. The
 // caller must begin receiving on the channel before the command is started.
 // The OutputStream never closes the channel.
-func NewOutputStream(streamChan chan string) *OutputStream {
+func NewOutputStream(streamChan chan string, ignoreIncompleteLines bool) *OutputStream {
 	out := &OutputStream{
 		streamChan: streamChan,
 		// --
-		bufSize:  DEFAULT_LINE_BUFFER_SIZE,
-		buf:      make([]byte, DEFAULT_LINE_BUFFER_SIZE),
-		lastChar: 0,
+		bufSize:               DEFAULT_LINE_BUFFER_SIZE,
+		buf:                   make([]byte, DEFAULT_LINE_BUFFER_SIZE),
+		lastChar:              0,
+		ignoreIncompleteLines: ignoreIncompleteLines,
 	}
 	return out
 }
@@ -738,7 +744,12 @@ func (rw *OutputStream) Write(p []byte) (n int, err error) {
 		firstChar += newlineOffset + 1
 	}
 
+	// if the stream (p) does not end in a '\n', then we will have firstChar < n
 	if firstChar < n {
+		// if we are ignoring incomplete lines, then we can just exit here
+		if rw.ignoreIncompleteLines {
+			return // implicit
+		}
 		remain := len(p[firstChar:])
 		bufFree := len(rw.buf[rw.lastChar:])
 		if remain > bufFree {
@@ -752,13 +763,13 @@ func (rw *OutputStream) Write(p []byte) (n int, err error) {
 				BufferSize: rw.bufSize,
 				BufferFree: bufFree,
 			}
+			fmt.Println(fmt.Errorf(err.Error()))
 			n = firstChar
 			return // implicit
 		}
 		copy(rw.buf[rw.lastChar:], p[firstChar:])
 		rw.lastChar += remain
 	}
-
 	return // implicit
 }
 
